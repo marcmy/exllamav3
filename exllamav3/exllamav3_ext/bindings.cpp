@@ -217,6 +217,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
 #endif
+    m.def("hgemm_f16compute", &hgemm_f16compute, "hgemm_f16compute");
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");

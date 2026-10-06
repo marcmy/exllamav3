@@ -731,6 +731,19 @@ class Generator:
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
+
+        # Some drafters can run an entire speculative round on-device, avoiding one host sync per step.
+        draft_round = getattr(self.draft_model, "draft_round", None)
+        if draft_round is not None and cal is None:
+            ids = draft_round(
+                batch_ids, temp_hidden,
+                {"block_table": block_index, "cache_seqlens": cache_seqlens, **shared_kv},
+                window,
+            )
+            if ids is not None:
+                self.draft_ids_pinned[:batch_size, :window].copy_(ids)
+                return self.draft_ids_pinned[:, :window]
+
         for idx in range(window):
             batch_logits = self.draft_model.forward(
                 input_ids = batch_ids,
@@ -828,6 +841,16 @@ class Generator:
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
 
+        # Drafters such as the Gemma 4 assistant read the target's K/V instead of maintaining their own.
+        shared_kv = {}
+        if self.draft_model.caps.get("mtp_shared_kv"):
+            shared_kv = {
+                "target_cache": self.cache,
+                "target_recurrent_states": [
+                    job.recurrent_state for job in self.active_jobs if job.is_prefill_done()
+                ] if self.recurrent_cache is not None else None,
+            }
+
         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
         # every row's running product of estimated conditional acceptance probabilities falls
         # below the confidence target, keeping the first low-confidence token as the label probe
@@ -843,6 +866,7 @@ class Generator:
                 "cache": self.draft_cache,
                 "cache_seqlens": cache_seqlens,
                 "draft_step": idx,   # heads specialized per depth pick their head from this
+                **shared_kv,
             }
             if cal is not None:
                 params["export_draft_conf"] = True

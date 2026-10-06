@@ -46,16 +46,27 @@ def staging_bytes(specs):
     return max((s["topk"] * s["expert_bytes"] for s in specs if s.get("expert_bytes")), default = 0)
 
 
-def ensure_staging(bufs, specs, device):
+def ensure_staging(bufs, specs, device, swizzle):
     """Allocate (or grow) the staging buffers in a device's persistent buffer dict
-    (MoeCpuHost._device_buffers): the raw gather target and, for swizzled arenas, the
-    native-order copy the fused kernel reads. Called from the host's measured-load buffer setup,
-    so the VRAM is accounted for before the split is planned, and again at first use"""
+    (MoeCpuHost._device_buffers): the raw gather target and, when any layer uses a band-swizzled
+    trellis layout, the native-order copy the fused kernel reads. Called from the host's
+    measured-load buffer setup, so VRAM is accounted for before the split is planned, and again
+    at first use."""
     need = staging_bytes(specs) // 2
+    need_native = swizzle and any(
+        ext.exl3_moe_cpu_swizzle_group(d[2])
+        for spec in specs
+        for d in spec.get("proj_dims", {}).values()
+        if d
+    )
     st = bufs.get("sd_stage")
+    native = bufs.get("sd_native")
     if need and (st is None or st.numel() < need):
         bufs["sd_stage"] = torch.empty(need, dtype = torch.int16, device = device)
-        bufs["sd_native"] = torch.empty(need, dtype = torch.int16, device = device) if bufs["swz"] else None
+    if need and need_native and (native is None or native.numel() < need):
+        bufs["sd_native"] = torch.empty(need, dtype = torch.int16, device = device)
+    elif not need_native:
+        bufs["sd_native"] = None
     return bufs.get("sd_stage"), bufs.get("sd_native")
 
 
@@ -67,8 +78,9 @@ class MoeStreamDecode:
     descriptors. forward() returns None wherever the worker should serve the call.
     """
 
-    def __init__(self, host):
+    def __init__(self, host, swizzle):
         self.host = host
+        self.swizzle = swizzle
         self.mode = host.stream_decode_mode          # "1" or "check"
         self.cpu_k = host.stream_decode_cpu          # picks per layer handed to the worker
         self.prof = host.stream_decode_prof
@@ -95,10 +107,11 @@ class MoeStreamDecode:
                 chunk_base = torch.tensor([a.data_ptr() for a in aliases], dtype = torch.long, device = device),
                 layers = {}, desc = {},
             )
-            D["swz"] = D["bufs"]["swz"]
             # Sized for every registered layer (the set is fixed once the worker has started);
             # the measured load allocated it already, this only grows a buffer it missed
-            D["stage"], D["native"] = ensure_staging(D["bufs"], self.host.specs, device)
+            D["stage"], D["native"] = ensure_staging(
+                D["bufs"], self.host.specs, device, self.swizzle
+            )
             self.dev[key] = D
         return D
 
@@ -128,16 +141,20 @@ class MoeStreamDecode:
         dev = D["chunk_base"].device
         gb, ub, _ = spec["proj_bytes"]
         Ku, Kd = pd["u"][2], pd["d"][2]
+        projs = [(off, d[0] // 16, d[1] // 16, d[2],
+                  ext.exl3_moe_cpu_swizzle_group(d[2]) if self.swizzle else 0)
+                 for off, d in ((0, pd.get("g")), (gb, pd["u"]), (gb + ub, pd["d"])) if d]
+        swz = any(p[4] for p in projs)
         return dict(
-            spec = spec, exp_b = exp_b, aux_id = id(aux),
+            spec = spec, exp_b = exp_b, aux_id = id(aux), swz = swz,
             blk_chunk = torch.tensor([int(b[0]) for b in blocks], dtype = torch.int32, device = dev),
             blk_off = torch.tensor([int(b[1]) for b in blocks], dtype = torch.long, device = dev),
             aux_ptrs = torch.tensor([[t.data_ptr() for t in aux[n]] for n in keys],
                                     dtype = torch.long, device = dev),
             Ks = (pd["g"][2] if gated else Ku, Ku, Kd),
-            # (byte offset, tiles_k, tiles_n, K) per projection, for the un-swizzle of swizzled arenas
-            projs = [(off, d[0] // 16, d[1] // 16, d[2])
-                     for off, d in ((0, pd.get("g")), (gb, pd["u"]), (gb + ub, pd["d"])) if d],
+            # (byte offset, tiles_k, tiles_n, K, swizzle_group) per projection. Group 0 is
+            # already native; 2/8 are restored before the fused GPU kernel reads the staging.
+            projs = projs,
             fb = host._stream_fused_bufs(D["bufs"], spec, dev),
         )
 
@@ -146,7 +163,7 @@ class MoeStreamDecode:
         topk = spec["topk"]
         k = min(max(int(self.cpu_k), 0), topk - 1)
         g = topk - k
-        base_t = D["native"] if D["swz"] else D["stage"]
+        base_t = D["native"] if L["swz"] else D["stage"]
         key = (spec["proj_bytes"], k, base_t.data_ptr())
         T = D["desc"].get(key)
         if T is None:
@@ -220,9 +237,11 @@ class MoeStreamDecode:
                 #    suh/svh pointers into the per-slot table, one launch
                 ext.moe_stream_gather(D["stage"], D["chunk_base"], L["blk_chunk"], L["blk_off"],
                                       sel_gpu, L["exp_b"], L["aux_ptrs"], T["d6"])
-                if D["swz"]:
-                    for off, tk, tn, K in L["projs"]:
-                        ext.moe_unswizzle_trellis(D["stage"], D["native"], g, L["exp_b"], off, tk, tn, K, K != 8)
+                if L["swz"]:
+                    for off, tk, tn, K, group in L["projs"]:
+                        ext.moe_unswizzle_trellis(
+                            D["stage"], D["native"], g, L["exp_b"], off, tk, tn, K, group
+                        )
                 if ev:
                     ev[1].record()
                 # 2. The fused MoE kernel over the staged experts, one row each

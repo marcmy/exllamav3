@@ -1085,7 +1085,7 @@ class MoeCpuHost:
         print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads")
         if self.stream_decode_mode:
             if self.pinned and self.arena_views:
-                self.stream_decode = MoeStreamDecode(self)
+                self.stream_decode = MoeStreamDecode(self, TUNING.swizzle)
             else:
                 print(" !! EXL3_MOE_STREAM_DECODE needs the pinned arena (EXL3_MOE_PINNED_ARENA=1); "
                       "decode steps take the worker path", flush = True)
@@ -1391,7 +1391,7 @@ class MoeCpuHost:
         # Streamed-decode staging (one slot per selected expert), accounted for at load with
         # the rings above
         if self.stream_decode_mode and self.pinned:
-            ensure_staging(d, self.specs, device)
+            ensure_staging(d, self.specs, device, TUNING.swizzle)
         # Reconstruct scratch sized for the largest projection registered so far; grows if a
         # later layer is larger
         if mx and (d["w_scratch"] is None or d["w_scratch"].numel() < mx):

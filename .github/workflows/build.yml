@@ -18,6 +18,7 @@ on:
           - all
           - windows
           - windows_smoke
+          - windows_sm75_smoke
           - cu132
           - torch_212_213
           - sdist
@@ -82,6 +83,11 @@ jobs:
               # regardless of the release input.
               combos = [dict(os = "windows-2022", pyver = "3.12", cuda = "12.8.1", rocm = "",
                              torch = "2.11.0", cudaarch = "8.6")]
+          elif target == "windows_sm75_smoke":
+              # Fork-specific Turing compile check. Build only sm_75 so the custom RTX 20-series
+              # kernels are actually instantiated by nvcc without paying for the full wheel matrix.
+              combos = [dict(os = "windows-2022", pyver = "3.12", cuda = "12.8.1", rocm = "",
+                             torch = "2.11.0", cudaarch = "7.5")]
           elif target == "cu132":
               combos = [c for c in combos if c["cuda"] == "13.2.0"]
           elif target == "torch_212_213":
@@ -488,7 +494,7 @@ jobs:
           python verify_wheel_metadata.py
 
       - name: Upload wheel files to GitHub release
-        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1' && inputs.target != 'windows_smoke'
+        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1' && !contains(fromJSON('["windows_smoke","windows_sm75_smoke"]'), inputs.target)
         uses: svenstaro/upload-release-action@2.6.1
         with:
           file: ./dist/*.whl
@@ -500,10 +506,10 @@ jobs:
       # Smoke builds never publish; the wheel lands as a workflow artifact instead so it can
       # still be pulled onto a Windows machine for a manual import/functional check
       - name: Upload wheel as workflow artifact (smoke build)
-        if: inputs.target == 'windows_smoke'
+        if: contains(fromJSON('["windows_smoke","windows_sm75_smoke"]'), inputs.target)
         uses: actions/upload-artifact@v4
         with:
-          name: smoke-wheel-py${{ matrix.pyver }}-cu${{ matrix.cuda }}-torch${{ matrix.torch }}
+          name: ${{ inputs.target == 'windows_sm75_smoke' && 'sm75-wheel' || 'smoke-wheel' }}-py${{ matrix.pyver }}-cu${{ matrix.cuda }}-torch${{ matrix.torch }}
           path: dist/*.whl
 
   build_sdist:

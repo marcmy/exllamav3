@@ -1,0 +1,33 @@
+name: Dispatch Scoop Excavator
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  dispatch:
+    name: Notify scoop-bucket
+    runs-on: ubuntu-24.04
+    environment: scoop-bucket
+    steps:
+      - name: Dispatch Excavator
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+          RELEASE_URL: ${{ github.event.release.html_url || format('https://github.com/{0}/releases', github.repository) }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::SCOOP_BUCKET_TOKEN is not available in the scoop-bucket environment."
+            exit 1
+          fi
+
+          gh api             --method POST             repos/marcmy/scoop-bucket/dispatches             -H "Accept: application/vnd.github+json"             -f event_type='exllamav3-released'             -f "client_payload[repository]=${GITHUB_REPOSITORY}"             -f "client_payload[tag]=${RELEASE_TAG}"             -f "client_payload[url]=${RELEASE_URL}"
+
+          echo "Dispatched exllamav3-released to marcmy/scoop-bucket." >> "$GITHUB_STEP_SUMMARY"

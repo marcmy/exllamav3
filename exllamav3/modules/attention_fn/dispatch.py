@@ -207,6 +207,10 @@ def attn_dispatch(
         candidates, hint_key = _fns_qc, "fn_qc"
     elif sdpa_prefill and cache is not None:
         candidates, hint_key = [fn_torch_sdpa_fallback_cache] + attn_fns, "fn_sdpa_pf"
+    elif sdpa_prefill:
+        # Cache-less Turing calls (e.g. vision towers and warmup) should avoid the very slow Triton
+        # prefill path on sm_75 and try PyTorch SDPA first.
+        candidates, hint_key = [fn_torch_sdpa_fallback_nocache] + attn_fns, "fn_sdpa_nc"
     else:
         candidates, hint_key = attn_fns, "fn"
 

@@ -38,6 +38,7 @@ from ..cache.recurrent import (
     new_checkpoint_handle,
 )
 from ..util import profile_opt
+from ..util.turing import turing_flag
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
 from ..cache.recurrent import host_copy
 
@@ -156,6 +157,22 @@ class GDNState:
         return stashed
 
 
+    def supports_inline_checkpoint(self) -> bool:
+        """
+        Whether a forward pass can take a recurrent checkpoint in the middle of its chunk (see
+        GatedDeltaNet.forward, params["recurrent_checkpoint"]): every recurrent layer is a GDN layer and runs
+        in this process
+        """
+        return not self.cache.model.loaded_tp and all(
+            isinstance(l, GDNLayerState) for l in self.cache.get_all_recurrent_layers().values()
+        )
+
+
+    def snapshot_at(self, position: int):
+        """The checkpoint taken at `position` by the last forward pass, in the form the recurrent cache stashes"""
+        return GDNStateSnapshot(self, position)
+
+
     def unstash(self, stashed: dict):
         assert self.position == stashed["position"]
         if not self.cache.model.loaded_tp:
@@ -181,6 +198,38 @@ class GDNState:
 
     def reset(self):
         self.position = 0
+
+
+class GDNStateSnapshot:
+    """
+    Recurrent checkpoint taken inside a forward pass at `position` (GatedDeltaNet.forward with
+    params["recurrent_checkpoint"]), handed to the recurrent cache in place of the live state: stash()
+    collects the per-layer copies in the form GDNState.stash() returns
+    """
+
+    def __init__(self, state: GDNState, position: int):
+        self.state = state
+        self.position = position
+
+
+    def stash(self):
+        stashed = {
+            "position": self.position,
+            "checkpoint_size": self.state.checkpoint_size
+        }
+        layers = self.state.cache.get_all_recurrent_layers()
+        for device in {l.device for l in layers.values() if l.device is not None}:
+            torch.cuda.synchronize(device)      # the per-layer copies to pinned memory were async
+        for k, l in layers.items():
+            snapshot = l.take_snapshot()
+            assert snapshot is not None, "Recurrent layer has no checkpoint from the last forward pass"
+            stashed[k] = snapshot
+        return stashed
+
+
+    def discard(self):
+        for l in self.state.cache.get_all_recurrent_layers().values():
+            l.pending_snapshot = False
 
 
 class GDNLayerState:
@@ -247,12 +296,37 @@ class GDNLayerState:
         )
 
 
+    def lazy_history(self, num_steps: int) -> bool:
+        """
+        True when the recurrent kernel records history lazily for this layer (sm_75 recurrent kernel, gdn.cu): the
+        initial state in history slot 1 and the step inputs in slot 2 instead of the state after every step, so a
+        rewind replays the accepted steps. Same rule as the kernel launcher: GDN (not KDA, not Mamba2) with 128-dim
+        heads, at least 3 history slots, and step inputs that fit one slot.
+        """
+        cache = self.__dict__.setdefault("_lazy_history", {})
+        lazy = cache.get(num_steps)
+        if lazy is None:
+            m = self.module
+            lazy = (
+                isinstance(m, GatedDeltaNet) and not getattr(m, "kda", False) and
+                m.k_head_dim == 128 and m.v_head_dim == 128 and self.recurrent_state.shape[1] >= 3 and
+                num_steps * ((m.num_k_heads + m.num_v_heads) * 128 + 2 * m.num_v_heads) <= m.num_v_heads * 128 * 128 and
+                turing_flag("GDN_REC75", self.recurrent_state.device) != 0
+            )
+            cache[num_steps] = lazy
+        return lazy
+
+
     def rewind(self, slot: int, last_history: int, num_tokens: int):
         assert num_tokens <= last_history
         if num_tokens > 0:
-            r_state = self.recurrent_state[slot, 0]
-            r_state_rewind = self.recurrent_state[slot, last_history + 1 - num_tokens]
-            r_state.copy_(r_state_rewind)
+            if self.lazy_history(last_history + 1):
+                ext.batched_state_rewind([self.rewind_state_job(slot, last_history, num_tokens)],
+                                         torch.device(self.device).index)
+            else:
+                r_state = self.recurrent_state[slot, 0]
+                r_state_rewind = self.recurrent_state[slot, last_history + 1 - num_tokens]
+                r_state.copy_(r_state_rewind)
         cdim = self.module.conv_kernel_size
         if last_history > 0:
             c_state = self.conv_state[slot, :, :cdim]
@@ -292,6 +366,10 @@ class GDNLayerState:
         rs = self.recurrent_state
         es = rs.element_size()
         base = rs.data_ptr() + slot * rs.stride(0) * es
+        if self.lazy_history(last_history + 1):
+            # Replay the accepted steps from the initial state (history slot 1) into slot 0
+            m = self.module
+            return ext.StateRewindJob(0, base, rs.stride(1), last_history + 1 - num_tokens, m.num_k_heads, m.num_v_heads)
         return ext.StateRewindJob(
             base + (last_history + 1 - num_tokens) * rs.stride(1) * es,
             base,
@@ -312,6 +390,31 @@ class GDNLayerState:
         s, c = stashed
         self.recurrent_state[slot, :1].copy_(s)
         self.conv_state[slot, :, :cdim].copy_(c)
+
+
+    def snapshot(self, slot: int):
+        """
+        Copy of this layer's state as stash() returns it, taken in the middle of a forward pass: an async copy to
+        pinned host buffers, collected (after one device sync for all layers) by take_snapshot()
+        """
+        cdim = self.module.conv_kernel_size
+        r, c = self.recurrent_state[slot, :1], self.conv_state[slot, :, :cdim]
+        if getattr(self, "snapshot_host", None) is None:
+            self.snapshot_host = (
+                torch.empty(r.shape, dtype = r.dtype, pin_memory = True),
+                torch.empty(c.shape, dtype = c.dtype, pin_memory = True),
+            )
+        self.snapshot_host[0].copy_(r, non_blocking = True)
+        self.snapshot_host[1].copy_(c, non_blocking = True)
+        self.pending_snapshot = True
+
+
+    def take_snapshot(self):
+        """The pending snapshot as owned host tensors (the caller has synchronized the device), or None"""
+        if not getattr(self, "pending_snapshot", False):
+            return None
+        self.pending_snapshot = False
+        return self.snapshot_host[0].clone(), self.snapshot_host[1].clone()
 
 
     def tp_export(self, plan):
@@ -1165,37 +1268,60 @@ class GatedDeltaNet(Module):
                 self.beta_scale
             )
 
-        # Convolution
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv = mixed_qkv,
-            conv_state = conv_state,
-            recurrent_slots = recurrent_slots,
-            conv1d_weight = self.conv1d_weight_flat,
-            conv1d_bias = self.conv1d_bias,
-            history = save_history,
-            params = params,
-            token_major = conv_token_major,
-        )
+        # Recurrent checkpoint inside the chunk (generator prefill): the convolution and the delta rule run in two
+        # parts, with a copy of the state taken at the boundary, so the projections, attention and MLP of the whole
+        # chunk run as one pass. Otherwise the checkpoint needs a separate pass over the short remainder, which pays
+        # a full weight reconstruct for a few hundred rows
+        cp = params.get("recurrent_checkpoint")
+        if cp is not None and save_state and not save_history and bsz == 1 and 0 < cp < seqlen:
+            spans = ((0, cp), (cp, seqlen))
+        else:
+            cp, spans = None, ((0, seqlen),)
 
-        # Delta rule
-        core_attn_out = gated_delta_rule_fn(
-            mixed_qkv = mixed_qkv,
-            beta = beta,
-            g = g,
-            recurrent_state = recurrent_state,
-            recurrent_slots = recurrent_slots,
-            history = save_history,
-            save_state = save_state,
-            num_k_heads = self.num_k_heads,
-            num_v_heads = self.num_v_heads,
-            k_dim = self.k_dim,
-            v_dim = self.v_dim,
-            k_head_dim = self.k_head_dim,
-            v_head_dim = self.v_head_dim,
-            params = params,
-            channelwise_g = self.kda,
-        )
-        del mixed_qkv, beta, g
+        parts = []
+        for r0, r1 in spans:
+            if len(spans) == 1:
+                mq, b_, g_ = mixed_qkv, beta, g
+            else:
+                mq = mixed_qkv[:, r0:r1] if conv_token_major else mixed_qkv[:, :, r0:r1].contiguous()
+                b_, g_ = beta[:, r0:r1], g[:, r0:r1]
+
+            # Convolution
+            mq = causal_conv1d_update(
+                mixed_qkv = mq,
+                conv_state = conv_state,
+                recurrent_slots = recurrent_slots,
+                conv1d_weight = self.conv1d_weight_flat,
+                conv1d_bias = self.conv1d_bias,
+                history = save_history,
+                params = params,
+                token_major = conv_token_major,
+            )
+
+            # Delta rule
+            parts.append(gated_delta_rule_fn(
+                mixed_qkv = mq,
+                beta = b_,
+                g = g_,
+                recurrent_state = recurrent_state,
+                recurrent_slots = recurrent_slots,
+                history = save_history,
+                save_state = save_state,
+                num_k_heads = self.num_k_heads,
+                num_v_heads = self.num_v_heads,
+                k_dim = self.k_dim,
+                v_dim = self.v_dim,
+                k_head_dim = self.k_head_dim,
+                v_head_dim = self.v_head_dim,
+                params = params,
+                channelwise_g = self.kda,
+            ))
+            del mq, b_, g_
+            if r1 == cp:
+                rsl.snapshot(rsg[0].slot)
+
+        core_attn_out = parts[0] if len(parts) == 1 else torch.cat(parts, dim = 1)
+        del mixed_qkv, beta, g, parts
 
         # Norm
         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)

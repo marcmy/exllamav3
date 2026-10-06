@@ -6,6 +6,7 @@ from ...util.turing import turing_flag
 from .common import AttnArgs, AttnFn
 from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
+from .fdq4 import fn_fdq4_decode_qc
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
 from .triton_paged import (
     _qc_staging,
@@ -33,6 +34,7 @@ _fns_triton_fast: list[AttnFn] = [
 # would silently attend over just the new K/V rows and ignore the cached context, so quant-direct calls only
 # ever dispatch over the qc-aware functions
 _fns_qc: list[AttnFn] = [
+    fn_fdq4_decode_qc,                  # Turing, 4-bit K/V, head_dim 256 (declines otherwise)
     fn_triton_paged_attn_decode_qc,
     fn_triton_paged_attn_prefill_qc,
 ]
@@ -102,6 +104,7 @@ def attn_dispatch(
     sinks: torch.Tensor | None = None,
     dispatch_cache: dict | None = None,
     max_kv_len: int | None = None,
+    cache_seqlens_host: tuple | None = None,
 ):
     """
     Select and run the first compatible attention implementation for the supplied tensors.
@@ -150,7 +153,8 @@ def attn_dispatch(
             # references (not the whole cache pool) into a compact fp16 scratch addressed through an
             # identity block table. The cache is up to date afterwards, so the write-back below is skipped
             layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)
-            npps_w = min(block_table.shape[1], -(-(int(cache_seqlens.max()) + q_len) // PAGE_SIZE))
+            past = max(cache_seqlens_host) if cache_seqlens_host is not None else int(cache_seqlens.max())
+            npps_w = min(block_table.shape[1], -(-(past + q_len) // PAGE_SIZE))
             bt = block_table[:, :npps_w].contiguous()
             k_cache = torch.empty((bsz * npps_w, PAGE_SIZE, num_kv_heads, dim), dtype = torch.half, device = q.device)
             v_cache = torch.empty_like(k_cache)
@@ -187,6 +191,8 @@ def attn_dispatch(
         max_kv_len = max_kv_len,
         window_right = window_right,
         sink_key0 = sink_key0,
+        cache_seqlens_host = cache_seqlens_host,
+        pages_contiguous = window_written,
     )
     # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache

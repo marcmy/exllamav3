@@ -324,6 +324,22 @@ same distribution. Stacks the collapse does not recognize fall back to the step-
 design. Set to `0` to disable collapsing entirely, e.g. for A/B validation against the
 reference implementation.
 
+### `EXL3_GEMV_SK` (default: `1`, used on sm_75 only)
+
+Small-m (1 <= m <= 8) EXL3 GEMV on sm_75 as a split-k kernel balanced per SM (`exl3_gemv_sk_kernel.cuh`)
+instead of one block per column group, for n <= 12288 (wider outputs keep the wide GEMV config). Equal work per
+SM for any shape, one fp32 partial per (block, column group), deterministic reduction, output transform in
+registers. `0` falls back to the block-per-group GEMV. Read per call.
+
+### `EXL3_GDN_REC75` (default: `1`, used on sm_75 only)
+
+Gated delta rule recurrent step (decode and speculative verify, per-head decay, 128-dim heads) on a sm_75 kernel that
+keeps the state in registers: one read per call and one write per step instead of two reads and a write per step,
+and all threads active. With speculative decoding (at least 3 history slots) the history is lazy: the verify
+stores the initial state and the per-step inputs instead of every intermediate state, and a rewind replays the
+accepted steps. Outputs and rewound states are bit-identical to the generic kernel. `0` falls back to it. Read per
+call by the extension and cached per layer by the rewind code, so do not change it while a model is loaded.
+
 ## CPU MoE offload
 
 Experimental: `-mcl`/`--moe_cpu_offload` (main model) and `-dmcl`/`--draft_moe_cpu_layers`

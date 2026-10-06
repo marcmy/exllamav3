@@ -10,7 +10,11 @@
 
 #include "norm.cuh"
 #include "hgemm.cuh"
+#include "turing/gdnh75.cuh"
+#include "turing/gdnwy75.cuh"
+#include "turing/gdno75.cuh"
 #include "turing/fa75.cuh"
+#include "turing/fdq4.cuh"
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
@@ -217,6 +221,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
 #endif
+    m.def("hgemm_f16compute", &hgemm_f16compute, "hgemm_f16compute");
+    m.def("gdnh75_fwd", &gdnh75_fwd, "gdnh75_fwd");
+    m.def("gdnwy75_fwd", &gdnwy75_fwd, "gdnwy75_fwd");
+    m.def("gdno75_fwd", &gdno75_fwd, "gdno75_fwd");
+    m.def("fdq4_decode", &fdq4_decode, "fdq4_decode");
+    m.def("fdq4_blocks_per_sm", &fdq4_blocks_per_sm, "fdq4_blocks_per_sm");
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");
@@ -252,7 +262,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     py::class_<ConvRewindJob>(m, "ConvRewindJob")
         .def(py::init<uintptr_t, uintptr_t, int, int, int>());
     py::class_<StateRewindJob>(m, "StateRewindJob")
-        .def(py::init<uintptr_t, uintptr_t, int64_t>());
+        .def(py::init<uintptr_t, uintptr_t, int64_t>())
+        .def(py::init<uintptr_t, uintptr_t, int64_t, int, int, int>());
     m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
     m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
 

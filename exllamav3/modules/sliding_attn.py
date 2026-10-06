@@ -12,6 +12,8 @@ from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_sw
 from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
 from ..util.backend import QKV_SLICE
+from ..util.turing import turing_flag
+import os
 from ..cache import Cache
 from ..cache.recurrent import (
     mp_cache_recurrent_stash,
@@ -26,6 +28,8 @@ from ..cache.recurrent import host_copy
 # (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
 # the cooperative GEMM)
 _qkv_slice_enable = QKV_SLICE
+# Turing: sliding-window prefill through fa75; set EXL3_FA75_SWA=0 to keep the Triton path
+_fa75_swa_ok = os.environ.get("EXL3_FA75_SWA", "1") != "0"
 
 
 class SWAExportedState:
@@ -1057,7 +1061,23 @@ class SlidingAttention(Module):
             )
             cache_seqlens = host_to_device(torch.tensor(hots, dtype = torch.int32), self.device)
 
-            if not non_causal_spans:
+            if (
+                not non_causal_spans and causal and _fa75_swa_ok and self.head_dim == 256 and
+                not self.logit_softcapping and self.sinks is None and q.dtype == torch.float16 and
+                turing_flag("FA75", self.device)
+            ):
+                # On sm_75 the Triton prefill kernel leaves tensor-core throughput on the table.
+                # Attend over [hot SWA state || new K/V] with the window-aware fa75 kernel.
+                o = torch.empty(q.shape, dtype = q.dtype, device = q.device)
+                for i, rs in enumerate(rsg):
+                    a0, hot = wposs[i], hots[i]
+                    if hot:
+                        kk = torch.cat((k_states[rs.slot, a0 : a0 + hot], k[i]), dim = 0)
+                        vv = torch.cat((v_states[rs.slot, a0 : a0 + hot], v[i]), dim = 0)
+                    else:
+                        kk, vv = k[i], v[i]
+                    ext.fa75_fwd_win(q[i], kk, vv, o[i], self.sm_scale, True, sw)
+            elif not non_causal_spans:
                 o = paged_attn_triton_prefill(
                     q, None, None, k_pages, v_pages, bt, cache_seqlens,
                     causal = causal,

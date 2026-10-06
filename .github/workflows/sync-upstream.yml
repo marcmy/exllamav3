@@ -1,0 +1,103 @@
+name: Sync upstream dev
+
+on:
+  push:
+    branches:
+      - custom/dev
+    paths:
+      - .github/workflows/sync-upstream.yml
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync-dev
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge turboderp-org/dev
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out custom branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: custom/dev
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch and merge upstream dev
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/turboderp-org/exllamav3.git
+          git fetch --prune --no-tags upstream dev
+
+          upstream_sha="$(git rev-parse upstream/dev)"
+          current_sha="$(git rev-parse HEAD)"
+          pending="$(git rev-list --count HEAD..upstream/dev)"
+
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "before_sha=$current_sha" >> "$GITHUB_OUTPUT"
+          echo "pending=$pending" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor upstream/dev HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "custom/dev already contains upstream dev." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if ! git merge --no-ff --no-edit -m "Merge turboderp-org/exllamav3 dev ($(echo $upstream_sha | cut -c1-8))" upstream/dev; then
+            conflicts="$(git diff --name-only --diff-filter=U || true)"
+            git merge --abort || true
+            {
+              echo "## Upstream sync failed"
+              echo
+              echo "Merge conflicts require manual resolution:"
+              echo '```'
+              printf '%s\n' "$conflicts"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "after_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Push merged branch
+        if: steps.sync.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin HEAD:refs/heads/custom/dev
+
+      - name: Summarize
+        if: always()
+        shell: bash
+        env:
+          CHANGED: ${{ steps.sync.outputs.changed }}
+          PENDING: ${{ steps.sync.outputs.pending }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+          BEFORE_SHA: ${{ steps.sync.outputs.before_sha }}
+          AFTER_SHA: ${{ steps.sync.outputs.after_sha }}
+        run: |
+          {
+            echo "## exllamav3 upstream sync"
+            echo "- source: turboderp-org/exllamav3@dev"
+            echo "- target: custom/dev"
+            echo "- pending upstream commits: ${PENDING:-unknown}"
+            echo "- changed: ${CHANGED:-unknown}"
+            echo "- upstream head: ${UPSTREAM_SHA:-unknown}"
+            echo "- previous fork head: ${BEFORE_SHA:-unknown}"
+            echo "- new fork head: ${AFTER_SHA:-unchanged}"
+          } >> "$GITHUB_STEP_SUMMARY"

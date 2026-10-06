@@ -1656,10 +1656,10 @@ void avx2_swz_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, 
             __m256i preg[bits];
             for (int i = 0; i < bits; ++i)
                 preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pA + i * 16));
-            avx2_rows_accum<bits>(preg, dup, mat.k, m, accA, mult, ones32);
+            avx2_rows_accum<bits, false>(preg, dup, mat.k, m, accA, mult, ones32);
             for (int i = 0; i < bits; ++i)
                 preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pB + i * 16));
-            avx2_rows_accum<bits>(preg, dup, mat.k, m, accB, mult, ones32);
+            avx2_rows_accum<bits, false>(preg, dup, mat.k, m, accB, mult, ones32);
         }
         for (int i = 0; i < m; ++i)
         {

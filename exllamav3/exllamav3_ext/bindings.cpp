@@ -220,6 +220,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
+    m.def("fa75_fwd_win", &fa75_fwd_win, "fa75_fwd_win");
 #endif
     m.def("hgemm_f16compute", &hgemm_f16compute, "hgemm_f16compute");
     m.def("gdnh75_fwd", &gdnh75_fwd, "gdnh75_fwd");

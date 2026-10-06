@@ -865,7 +865,8 @@ class GatedMLP(Module):
 
             for s in r:
 
-                if self.bc is not None and bsz * q_len <= MAX_BSZN:
+                # Internal fused CUDA-graph replay cannot run inside an outer graph capture.
+                if self.bc is not None and bsz * q_len <= MAX_BSZN and not params.get("outer_graph"):
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     self.bc.run_bszN(xv, d.view(xv.shape))

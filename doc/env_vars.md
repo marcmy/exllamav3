@@ -366,7 +366,7 @@ Fallback value for when `-mcl` is not set.
 Worker thread count, set per component via `config.infer_params.moe_cpu_threads` /
 `draft_moe_cpu_threads`. Takes precedence over `EXL3_MOE_CPU_THREADS` below when set.
 
-### `EXL3_MOE_CPU_THREADS` (default: `cpu_count // 2`)
+### `EXL3_MOE_CPU_THREADS` (default: physical cores minus `EXL3_MOE_HOST_CORES`; `cpu_count // 2` if that is `0`, pinning is off, or the topology is unreadable)
 
 Fallback worker thread count when the component's `-mclt`/`-dmclt` config value is not set.
 
@@ -768,17 +768,37 @@ Seconds the parent waits for the CPU worker to signal ready after every offloade
 been handed over. Startup is the shared-memory attach, layer registration and thread spawn,
 so the default is only a safety net against a wedged worker; raise it on very slow hosts.
 
-### `EXL3_MOE_CPU_PIN` (default: `1`)
+### `EXL3_MOE_CPU_PIN` (default: `1` on Windows, `0` on Linux)
 
 Pin each worker thread (and the worker's own main thread) to a distinct physical CPU core,
-SMT siblings last, instead of leaving placement to the OS scheduler. On an SMT host, unpinned
-placement is a real source of run-to-run throughput variance, two workers can land on the same
-physical core (contending for its execution resources) on one run and not the next; measured on
-a 24-core/48-thread SMT2 box, this swung matrix-decode throughput 61–105 GB/s run to run,
-pinned flat at ~105 GB/s (88% of the box's measured 24-thread DRAM read bandwidth). Set to `0`
-to disable, e.g. on a shared/multi-tenant host where fixed placement may fight the scheduler's
-own balancing across other processes. Falls back to no pinning if the CPU topology can't be
-read.
+SMT siblings last, instead of leaving placement to the OS scheduler, and reserve cores for the
+host process (`EXL3_MOE_HOST_CORES`). Two workers sharing a physical core, or a worker sharing
+one with the host's spin-waiting threads, becomes the straggler at every per-phase barrier of a
+job. Which side of that trade-off wins depends on the scheduler. On Windows the pinned layout
+with a reserved host core is faster and far steadier than floating threads. On Linux the
+opposite was measured end to end: CFS keeps the workers and the host's spin-waits on distinct
+cores by itself, while a pinned layout cannot adapt to whatever else lands on its cores and so
+settles on a different throughput level each run; unpinned runs are faster and repeatable.
+Hence the per-platform default; set it explicitly to test the other layout. Falls back to no
+pinning if the CPU topology can't be read.
+
+### `EXL3_MOE_HOST_CORES` (default: `1`)
+
+Physical cores kept free of worker threads and reserved for the host process. Only in effect with
+`EXL3_MOE_CPU_PIN` on (the Windows default): the pool then pins one compute thread per physical core; the parent process (the thread driving the
+forward, CUDA's driver threads, an API server's executor threads) is otherwise free to land on a
+worker's logical processor, and a pinned worker cannot move away, so it becomes the straggler at
+every per-phase barrier. The default worker count leaves this many cores free, and once the worker
+has started the host process is confined to them (both SMT siblings). If an explicit thread count
+covers every core, the host is confined to the SMT siblings no worker uses instead, so it never
+shares a logical processor with a worker. Measured on a 12-core Ryzen 9 7900X with an RTX 4090
+(Qwen3.8-Flash-Next, 408 of 512 experts per layer on the CPU): decode 11–32 tok/s with the host
+unpinned, 30–36 tok/s with a reserved core. The placement is planned once per process, from the
+first worker started; workers spawned later (draft model, reload) restore the original mask before
+pinning. `0` disables the reservation and the pinning. Windows applies the mask process-wide
+(single processor group only; boxes with more than 64 logical processors are left unpinned with a
+notice); Linux pins every current thread, and later threads inherit it. Never fails a load: OS
+errors print a notice and leave the host unpinned.
 
 ### `EXL3_MOE_HANDOFF_PROF` (default: unset)
 
@@ -1000,7 +1020,10 @@ supports it (CUDA 12.8 and later). Compression is applied to the finished images
 themselves are identical either way. `0` disables it, which may be needed to run a locally built
 extension on a driver that predates compressed images. `require` makes the build fail when nvcc
 does not offer the option instead of silently building uncompressed; the release wheels are built
-this way. Not used for ROCm builds.
+this way.
+
+On ROCm the device code objects are compressed with hipcc's `--offload-compress` (`0` disables it);
+the wheels carry one code object per RDNA family and would be several times larger without it.
 
 ### `TORCH_NO_COMPILER_WRAPPER` (default: unset)
 

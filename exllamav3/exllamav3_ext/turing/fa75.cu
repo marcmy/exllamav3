@@ -621,6 +621,7 @@ void fa75_fwd_win(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double
     TORCH_CHECK(q.stride(1) % 8 == 0 && q.stride(0) % 8 == 0 && k.stride(0) % 8 == 0 && k.stride(1) % 8 == 0 &&
                 v.stride(0) % 8 == 0 && v.stride(1) % 8 == 0, "16-byte aligned strides");
     int Tq = q.size(0), Hq = q.size(1), Tkv = k.size(0), Hkv = k.size(1);
+    TORCH_CHECK(o.size(0) == Tq && o.size(1) == Hq && o.size(2) == q.size(2), "output shape must match q");
     TORCH_CHECK(Hq % Hkv == 0 && v.size(0) == Tkv && v.size(1) == Hkv, "shapes");
     if (q.size(2) == HD2)
     {

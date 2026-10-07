@@ -64,3 +64,14 @@ def test_fa75_strided_q():
     ext.fa75_fwd(q, k, v, o, 0.0625, True)
     ref = _reference(q, k, v, 0.0625, True)
     assert ((o.float() - ref).abs().max() / ref.abs().max()).item() < 2e-3
+
+@pytest.mark.parametrize("head_dim", [256, 512])
+def test_fa75_rejects_mismatched_output_shape(head_dim):
+    torch.cuda.set_device(device)
+    q = torch.empty(1, 4, head_dim, device = device, dtype = torch.half)
+    k = torch.empty(1, 1, head_dim, device = device, dtype = torch.half)
+    v = torch.empty(1, 1, head_dim, device = device, dtype = torch.half)
+    o = torch.empty(1, 3, head_dim, device = device, dtype = torch.half)
+    with pytest.raises(RuntimeError, match = "output shape must match q"):
+        ext.fa75_fwd(q, k, v, o, head_dim ** -0.5, True)
+
